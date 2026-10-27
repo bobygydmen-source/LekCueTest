@@ -1,0 +1,371 @@
+using NAudio.Wave;
+using NAudio.Wave.SampleProviders;
+
+namespace LekCueTest;
+
+public sealed class AudioEngine : IDisposable
+{
+    SharedTrack? _track;
+    TrackReader? _master, _cue;
+    WaveOutEvent? _outMaster, _outCue;
+    AsioOut? _asio;
+    WaveInEvent? _mic;
+    BufferedWaveProvider? _micBuf;
+    int _shiftMs;
+
+    public event Action<float>? MicLevel;
+    public bool HasTrack => _track != null;
+    public bool Playing { get; private set; }
+    public TimeSpan Duration => _track?.Duration ?? TimeSpan.Zero;
+    public bool Finished => _master != null && _track != null && _master.PositionFrames >= _track.Frames + 4800;
+
+    public void Load(string path)
+    {
+        Stop();
+        _track = SharedTrack.Load(path);
+    }
+
+    static long MsToFrames(int ms) => (long)ms * SharedTrack.Rate / 1000;
+
+    /// <summary>Master = фанера (нормальное время) + микрофон. Cue = та же фанера, указатель впереди на shiftMs.</summary>
+    ISampleProvider BuildChains(int micDevice, int shiftMs)
+    {
+        _shiftMs = shiftMs;
+        _master = new TrackReader(_track!);
+        _cue = new TrackReader(_track!);
+        _cue.Seek(MsToFrames(shiftMs));
+
+        ISampleProvider masterMix = _master;
+        if (micDevice >= 0)
+        {
+            var fmt = new WaveFormat(SharedTrack.Rate, 16, 1);
+            _mic = new WaveInEvent { DeviceNumber = micDevice, WaveFormat = fmt, BufferMilliseconds = 20 };
+            _micBuf = new BufferedWaveProvider(fmt)
+            {
+                DiscardOnBufferOverflow = true,
+                BufferDuration = TimeSpan.FromMilliseconds(120)
+            };
+            _mic.DataAvailable += (s, e) =>
+            {
+                _micBuf.AddSamples(e.Buffer, 0, e.BytesRecorded);
+                MicLevel?.Invoke(Peak(e.Buffer, e.BytesRecorded));
+            };
+            var micStereo = new MonoToStereoSampleProvider(_micBuf.ToSampleProvider());
+            // Микрофон суммируется ТОЛЬКО в Master. В Cue его нет.
+            masterMix = new MixingSampleProvider(new ISampleProvider[] { _master, micStereo }) { ReadFully = true };
+        }
+        return masterMix;
+    }
+
+    static float Peak(byte[] b, int n)
+    {
+        int max = 0;
+        for (int i = 0; i + 1 < n; i += 2)
+        {
+            int v = Math.Abs((int)BitConverter.ToInt16(b, i));
+            if (v > max) max = v;
+        }
+        return max / 32768f;
+    }
+
+    /// <summary>Режим «без карты»: два обычных устройства вывода (колонки + наушники).</summary>
+    public void StartTwoDevices(int masterDev, int cueDev, int micDev, int shiftMs)
+    {
+        Stop();
+        var masterMix = BuildChains(micDev, shiftMs);
+        _outMaster = new WaveOutEvent { DeviceNumber = masterDev, DesiredLatency = 80, NumberOfBuffers = 3 };
+        _outCue = new WaveOutEvent { DeviceNumber = cueDev, DesiredLatency = 80, NumberOfBuffers = 3 };
+        _outMaster.Init(masterMix.ToWaveProvider());
+        _outCue.Init(_cue!.ToWaveProvider());
+        _mic?.StartRecording();
+        _outMaster.Play();
+        _outCue.Play();
+        Playing = true;
+    }
+
+    /// <summary>Режим «с картой»: одна ASIO-карта, Зал = каналы offset+1..2, Наушники = offset+3..4.</summary>
+    public void StartAsio(string driver, int channelOffset, int micDev, int shiftMs)
+    {
+        Stop();
+        var masterMix = BuildChains(micDev, shiftMs);
+        var mux = new MultiplexingSampleProvider(new[] { masterMix, (ISampleProvider)_cue! }, 4);
+        mux.ConnectInputToOutput(0, 0);
+        mux.ConnectInputToOutput(1, 1);
+        mux.ConnectInputToOutput(2, 2);
+        mux.ConnectInputToOutput(3, 3);
+        _asio = new AsioOut(driver) { ChannelOffset = channelOffset };
+        _asio.Init(mux.ToWaveProvider());
+        _mic?.StartRecording();
+        _asio.Play();
+        Playing = true;
+    }
+
+    /// <summary>Сдвиг можно менять на лету: двигаем только указатель наушников.</summary>
+    public void SetShift(int ms)
+    {
+        if (_cue == null) return;
+        _cue.Shift(MsToFrames(ms - _shiftMs));
+        _shiftMs = ms;
+    }
+
+    public void Stop()
+    {
+        Playing = false;
+        try { _mic?.StopRecording(); } catch { }
+        _mic?.Dispose(); _mic = null; _micBuf = null;
+        _outMaster?.Dispose(); _outMaster = null;
+        _outCue?.Dispose(); _outCue = null;
+        _asio?.Dispose(); _asio = null;
+    }
+
+    public void Dispose() => Stop();
+}
+
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>LekCueTest</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="NAudio" Version="2.2.1" />
+  </ItemGroup>
+</Project>
+
+using NAudio.Wave;
+
+namespace LekCueTest;
+
+public sealed class MainForm : Form
+{
+    readonly AudioEngine _eng = new();
+    readonly TableLayoutPanel _t = new() { ColumnCount = 2, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(14) };
+    readonly RadioButton rbNoCard = new() { Text = "Без карты: два обычных устройства (WaveOut)", Checked = true, AutoSize = true };
+    readonly RadioButton rbAsio = new() { Text = "С картой: одна ASIO-карта (Зал = каналы 1–2, Наушники = 3–4)", AutoSize = true };
+    readonly ComboBox cbMaster = Combo(), cbCue = Combo(), cbMic = Combo(), cbAsio = Combo();
+    readonly NumericUpDown nudCh = new() { Minimum = 0, Maximum = 60, Value = 0, Width = 60 };
+    readonly Button btnLoad = new() { Text = "📂 Загрузить фанеру (MP3/WAV)", AutoSize = true, Padding = new Padding(6) };
+    readonly Button btnPlay = new() { Text = "▶ PLAY", Width = 150, Height = 40, Font = new Font("Segoe UI", 12, FontStyle.Bold) };
+    readonly Label lblFile = new() { Text = "Файл не выбран", AutoSize = true };
+    readonly Label lblShift = new() { AutoSize = true };
+    readonly Label lblStatus = new() { AutoSize = true, ForeColor = Color.DimGray, MaximumSize = new Size(480, 0) };
+    readonly TrackBar trackShift = new() { Minimum = 0, Maximum = 200, TickFrequency = 20, Value = 80, Width = 380 };
+    readonly ProgressBar pbMic = new() { Width = 380, Height = 14, Maximum = 100 };
+    readonly List<Control> grpNoCard = new(), grpAsio = new();
+    readonly System.Windows.Forms.Timer _timer = new() { Interval = 200 };
+
+    static ComboBox Combo() => new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 380 };
+
+    public MainForm()
+    {
+        Text = "LEK CUE TEST: тестовый стенд синхронизации";
+        AutoSize = true; AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false;
+        StartPosition = FormStartPosition.CenterScreen;
+        Font = new Font("Segoe UI", 9.5f);
+
+        Span(rbNoCard); Span(rbAsio);
+        Row("🔊 Выход в Зал (Master):", cbMaster, grpNoCard);
+        Row("🎧 Выход в Наушники (Cue):", cbCue, grpNoCard);
+        Row("ASIO-драйвер карты:", cbAsio, grpAsio);
+        Row("Первый выходной канал:", nudCh, grpAsio);
+        Row("🎤 Микрофон (только в Зал):", cbMic);
+        Row("", btnLoad); Row("Файл:", lblFile);
+        Row("", btnPlay);
+        Row("Сдвиг для наушников:", trackShift); Row("", lblShift);
+        Row("Индикатор микрофона:", pbMic);
+        Span(lblStatus);
+        Controls.Add(_t);
+
+        for (int i = 0; i < WaveOut.DeviceCount; i++)
+        {
+            var name = WaveOut.GetCapabilities(i).ProductName;
+            cbMaster.Items.Add(name); cbCue.Items.Add(name);
+        }
+        if (cbMaster.Items.Count > 0) cbMaster.SelectedIndex = 0;
+        if (cbCue.Items.Count > 0) cbCue.SelectedIndex = Math.Min(1, cbCue.Items.Count - 1);
+
+        cbMic.Items.Add("(без микрофона)");
+        for (int i = 0; i < WaveIn.DeviceCount; i++) cbMic.Items.Add(WaveIn.GetCapabilities(i).ProductName);
+        cbMic.SelectedIndex = cbMic.Items.Count > 1 ? 1 : 0;
+
+        foreach (var d in AsioOut.GetDriverNames()) cbAsio.Items.Add(d);
+        if (cbAsio.Items.Count > 0) cbAsio.SelectedIndex = 0;
+        else rbAsio.Text += "  [ASIO-драйверы не найдены]";
+
+        rbNoCard.CheckedChanged += (s, e) => ApplyMode();
+        btnLoad.Click += (s, e) => LoadFile();
+        btnPlay.Click += (s, e) => { if (_eng.Playing) StopAll(); else StartAll(); };
+        trackShift.Scroll += (s, e) => { UpdateShiftLabel(); if (_eng.Playing) _eng.SetShift(trackShift.Value); };
+        _eng.MicLevel += lvl => { if (IsHandleCreated) BeginInvoke(() => pbMic.Value = Math.Min(100, (int)(lvl * 140))); };
+        _timer.Tick += (s, e) => { if (_eng.Playing && _eng.Finished) StopAll(); };
+        _timer.Start();
+        FormClosing += (s, e) => _eng.Dispose();
+
+        UpdateShiftLabel(); ApplyMode();
+        SetStatus("Режим «без карты»: колонки и наушники на разных устройствах. Режим «с картой»: одна ASIO-карта, точнее по времени.");
+    }
+
+    void Row(string label, Control c, List<Control>? grp = null)
+    {
+        var l = new Label { Text = label, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 6, 12, 6) };
+        c.Margin = new Padding(0, 3, 0, 3);
+        int r = _t.RowCount++;
+        _t.Controls.Add(l, 0, r); _t.Controls.Add(c, 1, r);
+        grp?.Add(l); grp?.Add(c);
+    }
+
+    void Span(Control c)
+    {
+        int r = _t.RowCount++;
+        _t.Controls.Add(c, 0, r); _t.SetColumnSpan(c, 2);
+        c.Margin = new Padding(0, 4, 0, 4);
+    }
+
+    void ApplyMode()
+    {
+        foreach (var c in grpNoCard) c.Visible = rbNoCard.Checked;
+        foreach (var c in grpAsio) c.Visible = !rbNoCard.Checked;
+        // radio-кнопки в одном контейнере, поэтому rbAsio переключается автоматически
+    }
+
+    void UpdateShiftLabel() => lblShift.Text = $"Сдвиг: -{trackShift.Value} мс (наушники слышат музыку раньше зала)";
+    void SetStatus(string s) => lblStatus.Text = s;
+
+    void LoadFile()
+    {
+        using var dlg = new OpenFileDialog { Filter = "Аудио (*.mp3;*.wav)|*.mp3;*.wav" };
+        if (dlg.ShowDialog() != DialogResult.OK) return;
+        try
+        {
+            StopAll();
+            Cursor = Cursors.WaitCursor;
+            _eng.Load(dlg.FileName);
+            lblFile.Text = $"{Path.GetFileName(dlg.FileName)}  ({_eng.Duration:mm\\:ss})";
+            SetStatus("Фанера загружена в память (один экземпляр).");
+        }
+        catch (Exception ex) { SetStatus("Ошибка загрузки: " + ex.Message); }
+        finally { Cursor = Cursors.Default; }
+    }
+
+    void StartAll()
+    {
+        if (!_eng.HasTrack) { SetStatus("Сначала загрузите фанеру."); return; }
+        try
+        {
+            int mic = cbMic.SelectedIndex - 1;
+            if (rbAsio.Checked)
+            {
+                if (cbAsio.SelectedItem is not string drv) { SetStatus("ASIO-драйвер не выбран."); return; }
+                _eng.StartAsio(drv, (int)nudCh.Value, mic, trackShift.Value);
+            }
+            else
+            {
+                if (cbMaster.SelectedIndex < 0 || cbCue.SelectedIndex < 0) { SetStatus("Выберите оба устройства вывода."); return; }
+                if (cbMaster.SelectedIndex == cbCue.SelectedIndex)
+                    SetStatus("Внимание: Зал и Наушники на одном устройстве, проверка будет бессмысленной.");
+                _eng.StartTwoDevices(cbMaster.SelectedIndex, cbCue.SelectedIndex, mic, trackShift.Value);
+            }
+            btnPlay.Text = "⏹ STOP";
+            Lock(true);
+        }
+        catch (Exception ex) { _eng.Stop(); SetStatus("Ошибка запуска: " + ex.Message); }
+    }
+
+    void StopAll()
+    {
+        _eng.Stop();
+        btnPlay.Text = "▶ PLAY";
+        pbMic.Value = 0;
+        Lock(false);
+    }
+
+    void Lock(bool on)
+    {
+        rbNoCard.Enabled = rbAsio.Enabled = !on;
+        cbMaster.Enabled = cbCue.Enabled = cbAsio.Enabled = cbMic.Enabled = nudCh.Enabled = !on;
+        btnLoad.Enabled = !on;
+    }
+}
+
+namespace LekCueTest;
+
+static class Program
+{
+    [STAThread]
+    static void Main()
+    {
+        ApplicationConfiguration.Initialize();
+        Application.Run(new MainForm());
+    }
+}
+
+using NAudio.Wave;
+using NAudio.Wave.SampleProviders;
+
+namespace LekCueTest;
+
+/// <summary>Одна фанера в памяти (48 кГц, стерео, float). Копий нет, читают все по своим указателям.</summary>
+public sealed class SharedTrack
+{
+    public const int Rate = 48000;
+    public float[] Data = Array.Empty<float>();
+    public WaveFormat Format = WaveFormat.CreateIEEEFloatWaveFormat(Rate, 2);
+    public long Frames => Data.Length / 2;
+    public TimeSpan Duration => TimeSpan.FromSeconds((double)Frames / Rate);
+
+    public static SharedTrack Load(string path)
+    {
+        using var reader = new AudioFileReader(path);
+        ISampleProvider sp = reader;
+        if (sp.WaveFormat.Channels == 1) sp = new MonoToStereoSampleProvider(sp);
+        else if (sp.WaveFormat.Channels != 2) throw new NotSupportedException("Нужен моно или стерео файл.");
+        if (sp.WaveFormat.SampleRate != Rate) sp = new WdlResamplingSampleProvider(sp, Rate);
+
+        var ms = new MemoryStream();
+        var buf = new float[Rate * 2];
+        var bytes = new byte[buf.Length * 4];
+        int n;
+        while ((n = sp.Read(buf, 0, buf.Length)) > 0)
+        {
+            Buffer.BlockCopy(buf, 0, bytes, 0, n * 4);
+            ms.Write(bytes, 0, n * 4);
+        }
+        var data = new float[ms.Length / 4];
+        Buffer.BlockCopy(ms.GetBuffer(), 0, data, 0, (int)ms.Length);
+        return new SharedTrack { Data = data };
+    }
+}
+
+/// <summary>Указатель чтения (Read Pointer) по общему массиву. Свой на каждый выход.</summary>
+public sealed class TrackReader : ISampleProvider
+{
+    readonly SharedTrack _t;
+    readonly object _lock = new();
+    long _pos; // в сэмплах (канал 0, канал 1, ...)
+
+    public TrackReader(SharedTrack t) => _t = t;
+    public WaveFormat WaveFormat => _t.Format;
+
+    public long PositionFrames { get { lock (_lock) return _pos / 2; } }
+    public void Seek(long frames) { lock (_lock) _pos = Math.Max(0, frames) * 2; }
+    public void Shift(long frames) { lock (_lock) _pos = Math.Max(0, _pos + frames * 2); }
+
+    public int Read(float[] buffer, int offset, int count)
+    {
+        long p;
+        lock (_lock) { p = _pos; _pos += count; }
+        var d = _t.Data;
+        int zerosBefore = p < 0 ? (int)Math.Min(count, -p) : 0;
+        Array.Clear(buffer, offset, zerosBefore);
+        long src = Math.Max(p, 0);
+        int want = count - zerosBefore;
+        int have = (int)Math.Max(0, Math.Min(want, d.Length - src));
+        if (have > 0) Array.Copy(d, src, buffer, offset + zerosBefore, have);
+        Array.Clear(buffer, offset + zerosBefore + have, want - have);
+        return count; // после конца файла отдаём тишину, указатель идёт дальше
+    }
+}
